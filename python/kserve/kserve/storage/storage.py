@@ -42,6 +42,7 @@ from ..logging import logger
 
 MODEL_MOUNT_DIRS = "/mnt/models"
 
+_ORACLE_RE = r"(https:\/\/)?(.+?\.)?objectstorage\.(.+?)\.(oraclecloud\.com|oci\.customer-oci\.com)(.+?)"
 _GCS_PREFIX = "gs://"
 _S3_PREFIX = "s3://"
 _HDFS_PREFIX = "hdfs://"
@@ -86,6 +87,8 @@ class Storage(object):
             Storage._download_s3(uri, out_dir)
         elif uri.startswith(_HDFS_PREFIX) or uri.startswith(_WEBHDFS_PREFIX):
             Storage._download_hdfs(uri, out_dir)
+        elif re.search(_ORACLE_RE, uri):
+            Storage._download_oci(uri, out_dir)
         elif re.search(_AZURE_BLOB_RE, uri):
             Storage._download_azure_blob(uri, out_dir)
         elif re.search(_AZURE_FILE_RE, uri):
@@ -122,20 +125,20 @@ class Storage(object):
 
         if storage_secret_json.get("type", "") == "s3":
             for env_var, key in (
-                ("AWS_ENDPOINT_URL", "endpoint_url"),
-                ("AWS_ACCESS_KEY_ID", "access_key_id"),
-                ("AWS_SECRET_ACCESS_KEY", "secret_access_key"),
-                ("AWS_DEFAULT_REGION", "region"),
-                ("AWS_CA_BUNDLE", "ca_bundle"),
-                ("S3_VERIFY_SSL", "verify_ssl"),
-                ("awsAnonymousCredential", "anonymous"),
+                    ("AWS_ENDPOINT_URL", "endpoint_url"),
+                    ("AWS_ACCESS_KEY_ID", "access_key_id"),
+                    ("AWS_SECRET_ACCESS_KEY", "secret_access_key"),
+                    ("AWS_DEFAULT_REGION", "region"),
+                    ("AWS_CA_BUNDLE", "ca_bundle"),
+                    ("S3_VERIFY_SSL", "verify_ssl"),
+                    ("awsAnonymousCredential", "anonymous"),
             ):
                 if key in storage_secret_json:
                     os.environ[env_var] = storage_secret_json.get(key)
 
         if (
-            storage_secret_json.get("type", "") == "hdfs"
-            or storage_secret_json.get("type", "") == "webhdfs"
+                storage_secret_json.get("type", "") == "hdfs"
+                or storage_secret_json.get("type", "") == "webhdfs"
         ):
             temp_dir = tempfile.mkdtemp()
             os.environ["HDFS_SECRET_DIR"] = temp_dir
@@ -205,7 +208,7 @@ class Storage(object):
                         "CA_BUNDLE_VOLUME_MOUNT_POINT"
                     )
                     ca_bundle_full_path = (
-                        global_ca_bundle_volume_mount_path + "/cabundle.crt"
+                            global_ca_bundle_volume_mount_path + "/cabundle.crt"
                     )
                 if os.path.exists(ca_bundle_full_path):
                     logger.info("ca bundle file(%s) exists." % (ca_bundle_full_path))
@@ -249,7 +252,7 @@ class Storage(object):
                 target_key = obj.key.rsplit("/", 1)[-1]
                 exact_obj_found = True
             elif bucket_path_last_part and object_last_path.startswith(
-                bucket_path_last_part
+                    bucket_path_last_part
             ):
                 target_key = object_last_path
             else:
@@ -363,9 +366,9 @@ class Storage(object):
         # Remove hdfs:// or webhdfs:// from the uri to get just the path
         # e.g. hdfs://user/me/model -> user/me/model
         if uri.startswith(_HDFS_PREFIX):
-            path = uri[len(_HDFS_PREFIX) :]
+            path = uri[len(_HDFS_PREFIX):]
         else:
-            path = uri[len(_WEBHDFS_PREFIX) :]
+            path = uri[len(_WEBHDFS_PREFIX):]
 
         if not config["HDFS_ROOTPATH"]:
             path = "/" + path
@@ -442,8 +445,8 @@ class Storage(object):
             prefix,
         )
         token = (
-            Storage._get_azure_storage_token()
-            or Storage._get_azure_storage_access_key()
+                Storage._get_azure_storage_token()
+                or Storage._get_azure_storage_access_key()
         )
         if token is None:
             logger.warning(
@@ -489,7 +492,7 @@ class Storage(object):
 
     @staticmethod
     def _download_azure_file_share(
-        uri, out_dir: str
+            uri, out_dir: str
     ):  # pylint: disable=too-many-locals
         account_name, account_url, share_name, prefix = Storage._parse_azure_uri(uri)
         logger.info(
@@ -515,7 +518,7 @@ class Storage(object):
             if depth < 0:
                 continue
             for item in share_client.list_directories_and_files(
-                directory_name=curr_prefix
+                    directory_name=curr_prefix
             ):
                 if item.is_directory:
                     stack.append(
@@ -621,6 +624,85 @@ class Storage(object):
         return out_dir
 
     @staticmethod
+    def _download_oci(uri, out_dir: str):
+        from oci.object_storage import ObjectStorageClient
+        from oci.auth.signers import InstancePrincipalsSecurityTokenSigner
+        from oci.auth.signers import get_oke_workload_identity_resource_principal_signer
+
+        def get_client():
+            auth_type = os.getenv("OCI_AUTHENTICATION_TYPE")
+            region = os.getenv("OCI_REGION")
+            if auth_type == "simple":
+                config = {
+                    "user": os.getenv("OCI_USER"),
+                    "key_content": os.getenv("OCI_PRIVATEKEY"),
+                    "fingerprint": os.getenv("OCI_FINGERPRINT"),
+                    "tenancy": os.getenv("OCI_TENANT"),
+                    "region": region
+                }
+
+                pass_phrase = os.getenv("OCI_PASSPHRASE")
+                if pass_phrase and len(pass_phrase) > 0:
+                    config["pass_phrase"] = pass_phrase
+                return ObjectStorageClient(config=config)
+            elif auth_type == "instance-principal":
+                signer = InstancePrincipalsSecurityTokenSigner()
+                return ObjectStorageClient(config={
+                    "region": region,
+                    "tenancy": signer.tenancy_id,
+                }, signer=signer)
+            else:
+                signer = get_oke_workload_identity_resource_principal_signer()
+                return ObjectStorageClient(config={
+                    "region": region,
+                }, signer=signer)
+
+        def get_bucket_details():
+            parts = uri.lstrip("https://").split("/")
+            if len(parts) < 5:
+                raise RuntimeError(
+                    "Failed to parse OCI Object Storage URI: %s" % uri
+                )
+            return parts[2], parts[4], parts[6] if len(parts) > 5 else None
+
+        client = get_client()
+        ns, bucket, prefix = get_bucket_details()
+        next = None
+        file_count = 0
+        while True:
+            response = client.list_objects(ns, bucket, start=next, prefix=prefix)
+            next = response.data.next_start_with
+            for summary in response.data.objects:
+                if summary.name.endswith("/"):
+                    continue
+                obj = client.get_object(
+                    namespace_name=ns,
+                    bucket_name=bucket,
+                    object_name=summary.name,
+                )
+                # Create dirs if necessary.
+                dirname = os.path.dirname(summary.name)
+                if dirname != summary.name:
+                    local_dir = os.path.join(
+                        out_dir, dirname
+                    )
+                if not os.path.isdir(local_dir):
+                    os.makedirs(local_dir, exist_ok=True)
+
+                # Write object to disk.
+                mimetype, _ = mimetypes.guess_type(summary.name)
+                dest_path = os.path.join(out_dir, summary.name)
+                with open(dest_path, 'wb') as f:
+                    f.write(obj.data.content)
+                file_count += 1
+            if not next:
+                break
+
+        if file_count == 1:
+            if mimetype in ["application/x-tar", "application/zip"]:
+                Storage._unpack_archive_file(dest_path, mimetype, out_dir)
+
+    @staticmethod
     def _download_from_uri(uri, out_dir=None):
         url = urlparse(uri)
         filename = os.path.basename(url.path)
@@ -652,7 +734,7 @@ class Storage(object):
                 "application/zip-compressed",
             )
             if mimetype == "application/zip" and not response.headers.get(
-                "Content-Type", ""
+                    "Content-Type", ""
             ).startswith(zip_content_types):
                 raise RuntimeError(
                     "URI: %s did not respond with any of following 'Content-Type': "
@@ -666,7 +748,7 @@ class Storage(object):
                 "application/gzip",
             )
             if mimetype == "application/x-tar" and not response.headers.get(
-                "Content-Type", ""
+                    "Content-Type", ""
             ).startswith(tar_content_types):
                 raise RuntimeError(
                     "URI: %s did not respond with any of following 'Content-Type': "
@@ -674,7 +756,7 @@ class Storage(object):
                     + ", ".join(tar_content_types)
                 )
             if (
-                mimetype != "application/zip" and mimetype != "application/x-tar"
+                    mimetype != "application/zip" and mimetype != "application/x-tar"
             ) and not response.headers.get("Content-Type", "").startswith(
                 "application/octet-stream"
             ):

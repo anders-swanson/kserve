@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kserve/kserve/pkg/credentials/oracle"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -292,6 +293,10 @@ func (c *CredentialBuilder) mountSecretCredential(secretName string, namespace s
 		volume, volumeMount := hdfs.BuildSecret(secret)
 		*volumes = utils.AppendVolumeIfNotExists(*volumes, volume)
 		container.VolumeMounts = append(container.VolumeMounts, volumeMount)
+	} else if _, ok := secret.Data[oracle.AuthenticationType]; ok {
+		log.Info("Setting secret envs for Oracle Cloud Infrastructure", "OCISecret", secret.Name)
+		envs := oracle.BuildSecretEnvs(secret)
+		container.Env = append(container.Env, envs...)
 	} else {
 		log.V(5).Info("Skipping unsupported secret", "Secret", secret.Name)
 	}
